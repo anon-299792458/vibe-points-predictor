@@ -15,28 +15,28 @@ same inflation as the COVID years.  The full timeline:
 
 Regression
 ----------
-For each course with ≥5 years of valid data that span at least two grading
-regimes, we fit:
+For each course with ≥3 years of valid data we fit a univariate Theil-Sen
+regression on year only, with 2× sample weights for years 2023–2025 (applied
+by duplicating those rows before fitting).
 
-    points = α + β·year_centered + γ·grade_adjustment_factor
+For 2026 prediction:  α + β·(2026 − year_mean)
+For 2027 projection:  α + β·(2027 − year_mean)  (speculative)
 
-using sklearn's HuberRegressor (robust M-estimator) with 2× sample weights
-for years 2023–2025.  This lets γ absorb the mechanical inflation, while β
-captures the structural demand trend.
+Courses with <3 years of data get history-only display (no prediction).
 
-If a course's data falls entirely within one regime (no variation in
-grade_adjustment_factor), we fall back to univariate Theil-Sen on year only.
+Confidence intervals
+--------------------
+80% prediction interval using the t-distribution at n−2 degrees of freedom:
 
-For 2026 prediction:  α + β·(2026 − year_mean) + γ·0.45
-For 2027 projection:  α + β·(2027 − year_mean) + γ·0.25  (speculative)
+    PI = point_estimate  ±  t(0.90, df=n−2) × σ_residuals × √(1 + 1/n)
 
-Cohort adjustment
------------------
-The grade_adjustment_factor already encodes the government-confirmed cohort-
-level shift, so no separate cohort-median correction is applied.  The cohort
-panel is retained for context only.
+With n=3, df=1 → t ≈ 3.08 (wide but honest).
+With n≥5, df≥3 → t narrows naturally.
 
-CI:  ±1.96 × σ_residuals × √(1 + 1/n)  — clamped to [0, 625].
+Confidence badge
+----------------
+    n = 3 or 4  →  "Low confidence (n=X)"
+    n ≥ 5       →  "Standard confidence (n=X)"
 """
 
 import sqlite3
@@ -44,8 +44,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from scipy.stats import theilslopes
-from sklearn.linear_model import HuberRegressor
+from scipy.stats import theilslopes, t as t_dist
 
 DB_PATH   = Path(__file__).parent / "predictor.db"
 
@@ -60,7 +59,7 @@ GRADE_ADJ_2027 = 0.25   # projected (speculative)
 
 RECENT_YEARS  = {2023, 2024, 2025}
 PRED_YEAR     = 2026
-MIN_YEARS     = 5
+MIN_YEARS     = 3
 TREND_THRESH  = 3.0     # |slope| pts/year below which trend is 'stable'
 
 
@@ -117,103 +116,91 @@ def compute_cohort_medians(df_cs: pd.DataFrame) -> dict[int, float]:
 def _predict(years: np.ndarray, points: np.ndarray,
              grade_adjs: np.ndarray) -> dict | None:
     """
-    Fit HuberRegressor(year, grade_adj) and return 2026 + optional 2027 estimates.
-    Falls back to Theil-Sen year-only when grade_adj has no variation.
+    Fit Theil-Sen (year only) and return 2026 + optional 2027 estimates.
+    Requires ≥3 valid data points.  2× weight applied to RECENT_YEARS by
+    duplicating those rows before fitting.
+
+    Prediction intervals use the t-distribution at 80% confidence with n−2
+    degrees of freedom, giving naturally wide intervals for small n.
     """
     n = len(years)
     if n < MIN_YEARS:
         return None
 
-    # Sample weights: 2× for recent years
-    weights = np.array([2.0 if y in RECENT_YEARS else 1.0 for y in years])
-
     # Centre year to improve numerical stability
     year_mean = float(np.mean(years))
-    yc = years - year_mean   # centred years
+    yc = years - year_mean
 
-    # Determine whether we have variation in grade_adj to identify γ
-    unique_adj = set(np.round(grade_adjs, 4))
-    has_variation = len(unique_adj) > 1
-
-    gamma = 0.0
-    if has_variation:
-        X = np.column_stack([yc, grade_adjs])
-        hub = HuberRegressor(epsilon=1.35, max_iter=300, fit_intercept=True)
-        hub.fit(X, points, sample_weight=weights)
-        slope     = float(hub.coef_[0])
-        gamma     = float(hub.coef_[1])
-        intercept = float(hub.intercept_)
-    else:
-        # Theil-Sen fallback — duplicate recent years for 2× weight
-        recent_mask = np.isin(years, list(RECENT_YEARS))
-        yr_w  = np.concatenate([yc,     yc[recent_mask]])
-        pts_w = np.concatenate([points, points[recent_mask]])
-        res       = theilslopes(pts_w, yr_w)
-        slope     = float(res.slope)
-        intercept = float(res.intercept)
+    # Theil-Sen with 2× weight for recent years via row duplication
+    recent_mask = np.isin(years, list(RECENT_YEARS))
+    yr_w  = np.concatenate([yc,     yc[recent_mask]])
+    pts_w = np.concatenate([points, points[recent_mask]])
+    res       = theilslopes(pts_w, yr_w)
+    slope     = float(res.slope)
+    intercept = float(res.intercept)
 
     # ── Point estimates ──
-    def _pred(pred_year, adj_factor):
-        raw = intercept + slope * (pred_year - year_mean) + gamma * adj_factor
+    def _pred(pred_year):
+        raw = intercept + slope * (pred_year - year_mean)
         return float(np.clip(raw, 0, 625))
 
-    pred_2026 = _pred(PRED_YEAR,     GRADE_ADJ_2026)
-    pred_2027 = _pred(PRED_YEAR + 1, GRADE_ADJ_2027)
+    pred_2026 = _pred(PRED_YEAR)
+    pred_2027 = _pred(PRED_YEAR + 1)
 
-    # ── Residuals & CI ──
-    fitted    = intercept + slope * yc + gamma * grade_adjs
+    # ── Residuals ──
+    fitted    = intercept + slope * yc
     residuals = points - fitted
-    resid_std = float(np.std(residuals, ddof=1)) if n > 1 else 25.0
+    resid_std = float(np.std(residuals, ddof=1)) if n > 2 else float(np.std(residuals, ddof=0))
 
+    # ── 80% prediction interval via t-distribution at df = n−2 ──
+    # t(0.90, df) gives the two-tailed 80% critical value
+    df = max(n - 2, 1)
+    t_crit = float(t_dist.ppf(0.90, df))
     pi_se_2026 = resid_std * np.sqrt(1 + 1 / n)
-    ci_lower   = float(np.clip(pred_2026 - 1.96 * pi_se_2026, 0, 625))
-    ci_upper   = float(np.clip(pred_2026 + 1.96 * pi_se_2026, 0, 625))
+    ci_lower   = float(np.clip(pred_2026 - t_crit * pi_se_2026, 0, 625))
+    ci_upper   = float(np.clip(pred_2026 + t_crit * pi_se_2026, 0, 625))
 
     pi_se_2027 = resid_std * np.sqrt(1 + 1 / n)
-    ci27_lower = float(np.clip(pred_2027 - 1.96 * pi_se_2027, 0, 625))
-    ci27_upper = float(np.clip(pred_2027 + 1.96 * pi_se_2027, 0, 625))
+    ci27_lower = float(np.clip(pred_2027 - t_crit * pi_se_2027, 0, 625))
+    ci27_upper = float(np.clip(pred_2027 + t_crit * pi_se_2027, 0, 625))
 
-    # ── Inflation component ──
-    # Points being removed going from the plateau (grade_adj=1.0) to 2026 (0.45)
-    inflation_removed = int(round(gamma * (1.0 - GRADE_ADJ_2026)))  # γ × 0.55
-    # Points of inflation still embedded in the 2026 prediction
-    inflation_remaining = int(round(gamma * GRADE_ADJ_2026))         # γ × 0.45
+    # ── Confidence badge ──
+    if n <= 4:
+        confidence_badge = f"Low confidence (n={n})"
+    else:
+        confidence_badge = f"Standard confidence (n={n})"
 
-    # ── Trend direction (structural, excluding inflation) ──
+    # ── Trend direction ──
     if   slope >  TREND_THRESH:  trend = 'up'
     elif slope < -TREND_THRESH:  trend = 'down'
     else:                        trend = 'stable'
 
     # ── Data quality ──
-    n_baseline  = int(np.sum(grade_adjs == 0.0))   # pre-inflation years
-    n_inflated  = int(np.sum(grade_adjs >= 0.5))    # plateau + 2025
-    if   resid_std > 60:                          quality = 'anomaly-heavy'
-    elif n >= 7 and has_variation and n_baseline >= 2: quality = 'good'
-    elif n >= 5:                                  quality = 'limited'
-    else:                                         quality = 'anomaly-heavy'
+    if   resid_std > 60: quality = 'anomaly-heavy'
+    elif n >= 7:         quality = 'good'
+    elif n >= 5:         quality = 'limited'
+    else:                quality = 'low-data'
 
     return {
         # 2026
-        'point_estimate':      int(round(pred_2026)),
-        'ci_lower':            int(round(ci_lower)),
-        'ci_upper':            int(round(ci_upper)),
+        'point_estimate':   int(round(pred_2026)),
+        'ci_lower':         int(round(ci_lower)),
+        'ci_upper':         int(round(ci_upper)),
         # 2027 (speculative)
-        'pred_2027':           int(round(pred_2027)),
-        'ci27_lower':          int(round(ci27_lower)),
-        'ci27_upper':          int(round(ci27_upper)),
+        'pred_2027':        int(round(pred_2027)),
+        'ci27_lower':       int(round(ci27_lower)),
+        'ci27_upper':       int(round(ci27_upper)),
+        # Confidence
+        'confidence_badge': confidence_badge,
         # Model diagnostics
-        'trend_direction':     trend,
-        'data_quality':        quality,
-        'slope':               round(slope,    4),
-        'gamma':               round(gamma,    3),
-        'intercept':           round(intercept, 2),
-        'year_mean':           round(year_mean, 1),
-        'residual_std':        round(resid_std,  2),
-        'n_years':             n,
-        'has_grade_variation': has_variation,
-        # Inflation breakdown
-        'inflation_removed':   inflation_removed,
-        'inflation_remaining': inflation_remaining,
+        'trend_direction':  trend,
+        'data_quality':     quality,
+        'slope':            round(slope,     4),
+        'intercept':        round(intercept, 2),
+        'year_mean':        round(year_mean, 1),
+        'residual_std':     round(resid_std,  2),
+        'n_years':          n,
+        't_crit':           round(t_crit,    3),
     }
 
 

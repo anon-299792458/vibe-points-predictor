@@ -25,6 +25,12 @@ st.markdown("""
   .trend-stable { color:#d97706; font-weight:700; }
   .disc       { font-size:0.82em; color:#64748b; margin-top:20px;
                 border-top:1px solid #e2e8f0; padding-top:12px; }
+  .badge-low  { display:inline-block; font-size:0.78em; font-weight:600;
+                color:#92400e; background:#fef3c7; border:1px solid #f59e0b;
+                border-radius:4px; padding:2px 8px; margin-top:6px; }
+  .badge-std  { display:inline-block; font-size:0.78em; font-weight:600;
+                color:#1e40af; background:#eff6ff; border:1px solid #93c5fd;
+                border-radius:4px; padding:2px 8px; margin-top:6px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -185,11 +191,14 @@ def main():
     # ── Prediction block ──
     if pred:
         trend_html = TREND_HTML.get(pred["trend_direction"], "")
+        badge_text = pred.get("confidence_badge", "")
+        badge_cls  = "badge-low" if badge_text.startswith("Low") else "badge-std"
         st.markdown(
             f'<div class="pred-block">'
             f'<div class="pred-num">{pred["point_estimate"]}</div>'
-            f'<div class="pred-ci">95% CI &nbsp;[{pred["ci_lower"]} – {pred["ci_upper"]}]</div>'
+            f'<div class="pred-ci">80% CI &nbsp;[{pred["ci_lower"]} – {pred["ci_upper"]}]</div>'
             f'<div style="margin-top:8px;font-size:1.0em;">{trend_html}</div>'
+            f'<div><span class="{badge_cls}">{badge_text}</span></div>'
             f'</div>',
             unsafe_allow_html=True,
         )
