@@ -15,23 +15,30 @@ same inflation as the COVID years.  The full timeline:
 
 Regression
 ----------
-For each course with ≥3 years of valid data we fit a univariate Theil-Sen
-regression on year only, with 2× sample weights for years 2023–2025 (applied
-by duplicating those rows before fitting).
+For each course with ≥3 years of valid data we fit OLS (ordinary least
+squares) on year only.  Recent years (2023–2025) receive 2× weight, applied
+by duplicating those rows before fitting.  OLS is used (not Theil-Sen) so that
+the t-distribution prediction interval formula is statistically valid.
 
-For 2026 prediction:  α + β·(2026 − year_mean)
-For 2027 projection:  α + β·(2027 − year_mean)  (speculative)
+For 2026 prediction:  α + β·year
+For 2027 projection:  α + β·year  (speculative)
 
 Courses with <3 years of data get history-only display (no prediction).
 
 Confidence intervals
 --------------------
-80% prediction interval using the t-distribution at n−2 degrees of freedom:
+Full 80% OLS prediction interval, including the extrapolation leverage term:
 
-    PI = point_estimate  ±  t(0.90, df=n−2) × σ_residuals × √(1 + 1/n)
+    s   = √( Σeᵢ² / (n−2) )          residual std on original n points
+    h   = 1/n + (x_new − x̄)² / Sxx   leverage at the prediction point
+    PI  = ŷ  ±  t(0.90, df=n−2) × s × √(1 + h)
 
-With n=3, df=1 → t ≈ 3.08 (wide but honest).
-With n≥5, df≥3 → t narrows naturally.
+The leverage term (x_new − x̄)²/Sxx widens the interval honestly for
+extrapolation — predicting 2026 from data ending in 2025 always incurs this.
+
+With n=3, df=1 → t ≈ 3.08, and leverage for a 1-year extrapolation ≈ 4+,
+giving a very wide but honest interval.  With n≥8 the interval narrows
+substantially.
 
 Confidence badge
 ----------------
@@ -44,7 +51,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from scipy.stats import theilslopes, t as t_dist
+from scipy.stats import t as t_dist
 
 DB_PATH   = Path(__file__).parent / "predictor.db"
 
@@ -116,59 +123,65 @@ def compute_cohort_medians(df_cs: pd.DataFrame) -> dict[int, float]:
 def _predict(years: np.ndarray, points: np.ndarray,
              grade_adjs: np.ndarray) -> dict | None:
     """
-    Fit Theil-Sen (year only) and return 2026 + optional 2027 estimates.
-    Requires ≥3 valid data points.  2× weight applied to RECENT_YEARS by
-    duplicating those rows before fitting.
+    Fit OLS (year only) and return 2026 + 2027 estimates with 80% prediction
+    intervals.  Requires ≥3 valid data points.
 
-    Prediction intervals use the t-distribution at 80% confidence with n−2
-    degrees of freedom, giving naturally wide intervals for small n.
+    Recent years (RECENT_YEARS) receive 2× weight by row duplication before
+    fitting.  Residuals and PI are computed on the original n observations so
+    that degrees of freedom reflect actual data, not the duplicated set.
+
+    PI formula (full OLS, includes extrapolation leverage):
+        s     = sqrt( sum(eᵢ²) / (n-2) )
+        h_new = 1/n + (x_new - x̄)² / Sxx
+        PI    = ŷ ± t(0.90, n-2) × s × sqrt(1 + h_new)
     """
     n = len(years)
     if n < MIN_YEARS:
         return None
 
-    # Centre year to improve numerical stability
     year_mean = float(np.mean(years))
-    yc = years - year_mean
 
-    # Theil-Sen with 2× weight for recent years via row duplication
+    # ── OLS fit on row-duplicated data (2× weight for recent years) ──
     recent_mask = np.isin(years, list(RECENT_YEARS))
-    yr_w  = np.concatenate([yc,     yc[recent_mask]])
+    yr_w  = np.concatenate([years, years[recent_mask]])
     pts_w = np.concatenate([points, points[recent_mask]])
-    res       = theilslopes(pts_w, yr_w)
-    slope     = float(res.slope)
-    intercept = float(res.intercept)
+    slope, intercept = np.polyfit(yr_w, pts_w, 1)
+    slope     = float(slope)
+    intercept = float(intercept)
 
     # ── Point estimates ──
-    def _pred(pred_year):
-        raw = intercept + slope * (pred_year - year_mean)
-        return float(np.clip(raw, 0, 625))
+    def _pred(x):
+        return float(np.clip(intercept + slope * x, 0, 625))
 
     pred_2026 = _pred(PRED_YEAR)
     pred_2027 = _pred(PRED_YEAR + 1)
 
-    # ── Residuals ──
-    fitted    = intercept + slope * yc
+    # ── Residuals on the original n points, df = n-2 ──
+    fitted    = intercept + slope * years
     residuals = points - fitted
-    resid_std = float(np.std(residuals, ddof=1)) if n > 2 else float(np.std(residuals, ddof=0))
+    df        = max(n - 2, 1)
+    s         = float(np.sqrt(np.sum(residuals ** 2) / df))
 
-    # ── 80% prediction interval via t-distribution at df = n−2 ──
-    # t(0.90, df) gives the two-tailed 80% critical value
-    df = max(n - 2, 1)
+    # ── Full OLS prediction interval with extrapolation leverage ──
+    # h_new = 1/n + (x_new - x_bar)^2 / Sxx
+    Sxx = float(np.sum((years - year_mean) ** 2))
+
+    def _pi_half(x_new):
+        h = (1.0 / n) + ((x_new - year_mean) ** 2 / Sxx if Sxx > 0 else 0.0)
+        return s * float(np.sqrt(1.0 + h))
+
+    # t(0.90, df) is the 80% two-tailed critical value
     t_crit = float(t_dist.ppf(0.90, df))
-    pi_se_2026 = resid_std * np.sqrt(1 + 1 / n)
-    ci_lower   = float(np.clip(pred_2026 - t_crit * pi_se_2026, 0, 625))
-    ci_upper   = float(np.clip(pred_2026 + t_crit * pi_se_2026, 0, 625))
 
-    pi_se_2027 = resid_std * np.sqrt(1 + 1 / n)
-    ci27_lower = float(np.clip(pred_2027 - t_crit * pi_se_2027, 0, 625))
-    ci27_upper = float(np.clip(pred_2027 + t_crit * pi_se_2027, 0, 625))
+    ci_lower   = float(np.clip(pred_2026 - t_crit * _pi_half(PRED_YEAR),     0, 625))
+    ci_upper   = float(np.clip(pred_2026 + t_crit * _pi_half(PRED_YEAR),     0, 625))
+    ci27_lower = float(np.clip(pred_2027 - t_crit * _pi_half(PRED_YEAR + 1), 0, 625))
+    ci27_upper = float(np.clip(pred_2027 + t_crit * _pi_half(PRED_YEAR + 1), 0, 625))
 
     # ── Confidence badge ──
-    if n <= 4:
-        confidence_badge = f"Low confidence (n={n})"
-    else:
-        confidence_badge = f"Standard confidence (n={n})"
+    confidence_badge = (
+        f"Low confidence (n={n})" if n <= 4 else f"Standard confidence (n={n})"
+    )
 
     # ── Trend direction ──
     if   slope >  TREND_THRESH:  trend = 'up'
@@ -176,10 +189,10 @@ def _predict(years: np.ndarray, points: np.ndarray,
     else:                        trend = 'stable'
 
     # ── Data quality ──
-    if   resid_std > 60: quality = 'anomaly-heavy'
-    elif n >= 7:         quality = 'good'
-    elif n >= 5:         quality = 'limited'
-    else:                quality = 'low-data'
+    if   s    > 60: quality = 'anomaly-heavy'
+    elif n   >= 7:  quality = 'good'
+    elif n   >= 5:  quality = 'limited'
+    else:           quality = 'low-data'
 
     return {
         # 2026
@@ -198,7 +211,7 @@ def _predict(years: np.ndarray, points: np.ndarray,
         'slope':            round(slope,     4),
         'intercept':        round(intercept, 2),
         'year_mean':        round(year_mean, 1),
-        'residual_std':     round(resid_std,  2),
+        'residual_std':     round(s,          2),
         'n_years':          n,
         't_crit':           round(t_crit,    3),
     }

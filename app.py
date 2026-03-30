@@ -37,7 +37,7 @@ st.markdown("""
 
 @st.cache_data(show_spinner="Loading data …")
 def load_data():
-    from model import run_predictions
+    from model import run_predictions  # v3: OLS + full PI with leverage term
     records, _, _ = run_predictions()
     return records
 
